@@ -49,6 +49,55 @@ Worker 通过 Cloudflare Workers 访问 Freebuff，上游通常会将请求识�
 
 > 🌐 **自定义域名**：如果 `*.workers.dev` 域名访问不通（部分地区被墙/受限），可给 Worker 绑定自己的域名，Base URL 改为 `https://你的域名/v1`。配置方法见下方「[自定义域名](#-自定义域名)」。
 
+## 🐳 Docker 容器化部署（替代 CF Worker）
+
+> 适合本地/NAS 长期运行：不受 CF Workers 免费版 10ms CPU 限制，可承载并发；同一套代码即跑在 CF 也跑在 Docker。
+
+### 文件说明
+
+| 文件 | 说明 |
+|---|---|
+| `worker.js` | 核心逻辑（与 CF 部署共用，支持 `CODEBUFF_API`/`RELAY_KEY` 环境变量覆盖） |
+| `server.js` | Node 适配层：把 HTTP 请求转成 CF Worker 的 `fetch(request, env)` 格式 |
+| `Dockerfile` | node:20-alpine，无 npm 依赖 |
+| `docker-compose.yml` | 端口映射 + 环境变量 + credentials 只读挂载 |
+
+### 部署步骤
+
+```bash
+# 1. 准备目录
+mkdir freebuff2api && cd freebuff2api
+# 复制 worker.js server.js package.json Dockerfile docker-compose.yml 到本目录
+
+# 2. 环境变量（.env 不会被 git 追踪）
+cat > .env <<'EOF'
+RELAY_KEY=
+FREEBUFF_API_KEY=your-api-key
+EOF
+
+# 3. 账号凭据（server.js 会读取 credentials/*.json 的 authToken 字段）
+mkdir -p credentials
+# 每个文件一个账号：
+# credentials/<email>.json = {"email": "...", "authToken": "...", "name": "..."}
+
+# 4. 启动
+chmod 600 .env credentials/*.json
+docker compose up -d --build
+```
+
+### 环境变量
+
+| 变量 | 说明 |
+|---|---|
+| `PORT` | 监听端口，默认 8787 |
+| `HOST` | 监听地址，默认 0.0.0.0 |
+| `FREEBUFF_API_KEY` | 本 API 访问 key（缺省 `freebuff-default-key`） |
+| `FREEBUFF_DEBUG` | `true` 开启请求级调试日志 |
+| `CODEBUFF_API` | 上游地址，默认 `https://www.codebuff.com`；走 CF Relay 时设为 Relay 域名 |
+| `RELAY_KEY` | 中继密钥（`CODEBUFF_API` 指向带鉴权的中继时必填） |
+
+> ⚠️ 容器内 `credentials/` 以只读方式挂载；`server.js` 启动时读取并组装 `FREEBUFF_TOKEN`（多账号逗号分隔）。
+
 ## ❤️ 健康检查
 
 部署后可用（**无需 API key**）：

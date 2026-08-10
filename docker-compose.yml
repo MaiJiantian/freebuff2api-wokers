@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  freebuff2api:
+    build: .
+    image: freebuff2api:1.7.0
+    container_name: freebuff2api
+    restart: unless-stopped
+    ports:
+      - "8877:8787"
+    environment:
+      - PORT=8787
+      - HOST=0.0.0.0
+      # 上游固定指向 CF Relay（美国出口）。置空则直连 www.codebuff.com
+      - CODEBUFF_API=https://freebuff-relay.yjzsg.workers.dev
+      - RELAY_KEY=${RELAY_KEY}
+      - FREEBUFF_API_KEY=${FREEBUFF_API_KEY}
+      - FREEBUFF_DEBUG=false
+    volumes:
+      - ./credentials:/app/credentials:ro

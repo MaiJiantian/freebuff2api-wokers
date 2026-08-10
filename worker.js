@@ -1,4 +1,5 @@
-const CODEBUFF_API = "https://www.codebuff.com";
+let CODEBUFF_API = "https://www.codebuff.com";
+let RELAY_KEY = "";
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const DEFAULT_API_KEY = "freebuff-default-key";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
@@ -23,6 +24,9 @@ const MODELS = [
 
 export default {
   async fetch(request, env) {
+    // v1.7 容器化：允许用环境变量覆盖上游地址与中继密钥
+    if (env.CODEBUFF_API) CODEBUFF_API = env.CODEBUFF_API;
+    if (env.RELAY_KEY) RELAY_KEY = env.RELAY_KEY;
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
@@ -63,7 +67,7 @@ export default {
       return handleResponses(request, env);
     }
     if (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages")) {
-      return jsonResponse({ error: { message: "Anthropic endpoint not yet implemented", type: "not_implemented" } }, 501);
+      return handleMessages(request, env);
     }
     return jsonResponse({ error: { message: "Not found", type: "not_found" } }, 404);
   },
@@ -76,6 +80,12 @@ export default {
 let accountIdx = 0;
 const cooldowns = new Map();      // token -> 冷却到期 ms
 const sessCache = new Map();      // `${token}:${sessionModel}` -> { instanceId, model, remainingMs, expiresAt }（必须带 token，多账号防串号）
+
+/** 进行中的 session 创建（token:model → Promise），防止并发重复创建浪费额度 */
+const pendingSessions = new Map();
+
+/** 每个 token 当前活跃的 chat 请求数，用于防钉号并发冲突 */
+const activeRequestsPerToken = new Map();
 
 function parseAccounts(env) {
   // 支持一行一个（换行）或逗号分隔；每项可为纯 token 或 "token:uid"（冒号配对 user_id）
@@ -106,7 +116,6 @@ const PROBE_TTL_MS = 10 * 60 * 1000; // 探测结果缓存 10 分钟，避免每
  * 
  * 额外：GET /api/v1/freebuff/session 拿 rateLimitsByModel → quota（recentCount/limit），
  * 供 pickToken 按剩余额度选号（v1.6.2）。GET 不建 session，0 消耗。
- * 服务端可能默认返回 compact 响应；显式请求完整额度快照，避免 quota 探测退化。
  */
 async function probeAccount(token) {
   const cached = acctHealth.get(token);
@@ -154,6 +163,21 @@ async function probeAllAccounts(env) {
   return results;
 }
 
+let pickLock = Promise.resolve();
+
+/** 带锁的选号：确保同一时刻只有一个请求在选号，避免并发读 accountIdx */
+async function pickTokenLocked(env, sessionModel) {
+  return new Promise((resolve) => {
+    pickLock = pickLock.then(() => {
+      const acct = pickToken(env, sessionModel);
+      if (acct && acct.token) {
+        activeRequestsPerToken.set(acct.token, (activeRequestsPerToken.get(acct.token) || 0) + 1);
+      }
+      return Promise.resolve().then(() => resolve(acct));
+    });
+  });
+}
+
 function pickToken(env, sessionModel) {
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
@@ -181,13 +205,16 @@ function pickToken(env, sessionModel) {
   });
   const finalPool = withQuota.length > 0 ? withQuota : quotaSorted; // 全部耗尽时回退排序池（仍有额度概念）
 
-  // 优先复用已有活跃 session 缓存的号：一个 session 约 1 小时有效，创建 session 才扣
+    // 优先复用已有活跃 session 缓存的号：一个 session 约 1 小时有效，创建 session 才扣
   // 免费额度（如 v4-pro 每天 6 次）。纯轮询会让每个请求都切号、各建一个 session，
   // 浪费创建额度。只要当前模型的 session 缓存还活跃就钉在同一个号上，用满再换。
+  // 但钉号不能超过 1 个活跃请求，并发 >1 时会 chat 冲突，必须分散到其他号。
   if (sessionModel) {
     for (const acct of finalPool) {
       const t = acct.token;
       if (cooldowns.has(t) && cooldowns.get(t) > Date.now()) continue;
+      const active = activeRequestsPerToken.get(t) || 0;
+      if (active >= 1) continue; // 已有活跃请求的号跳过，让并发分散到其他号
       const cached = sessCache.get(t + ":" + sessionModel);
       if (cached && cached.expiresAt && new Date(cached.expiresAt).getTime() > Date.now() + 60000) {
         return acct;
@@ -195,13 +222,25 @@ function pickToken(env, sessionModel) {
     }
   }
 
-  // 没有活跃缓存才轮询（跳过冷却中的号）
+  // 没有活跃缓存才轮询（跳过冷却中的号 + 已有活跃请求的号）
   for (let k = 0; k < finalPool.length; k++) {
     const acct = finalPool[accountIdx % finalPool.length];
     accountIdx = (accountIdx + 1) % finalPool.length;
     const t = acct.token;
-    if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return acct;
+    if (cooldowns.has(t) && cooldowns.get(t) > Date.now()) continue;
+    const active = activeRequestsPerToken.get(t) || 0;
+    if (active >= 1) continue; // 已有活跃请求的号跳过，让并发分散到其他号
+    return acct;
   }
+  // 全部号都有活跃请求/冷却中：退而求其次，选第一个活跃请求最少的号
+  let best = null, bestActive = Infinity;
+  for (const acct of finalPool) {
+    const t = acct.token;
+    if (cooldowns.has(t) && cooldowns.get(t) > Date.now()) continue;
+    const active = activeRequestsPerToken.get(t) || 0;
+    if (active < bestActive) { bestActive = active; best = acct; }
+  }
+  if (best) return best;
   const oldest = [...cooldowns.entries()].sort((a, b) => a[1] - b[1])[0];
   if (oldest) cooldowns.delete(oldest[0]);
   return pool[0];
@@ -218,6 +257,8 @@ function cooldown(token, ms) {
  * - 剩余 <= 0 → 该号额度耗尽（跳过）
  */
 function remainingQuota(token, sessionModel) {
+  // flash 无限量，跳过配额检查让并发分散到不同账号
+  if (sessionModel && sessionModel.includes("flash")) return 100;
   const h = acctHealth.get(token);
   if (!h || !h.quota) return null;
   let entry = h.quota[sessionModel];
@@ -247,20 +288,33 @@ function parseCooldown(text, status) {
 }
 
 // ---------------------------------------------------------------------------
-// 上游请求（串行队列，免费通道并发超过 1 就出问题）
+// 上游请求（按 token 分队列，不同账号可并行，同一账号串行以避免免费通道冲突）
 // ---------------------------------------------------------------------------
 
 let chainTail = Promise.resolve();
-const CHAIN_GAP_MS = 300; // 上游免费通道并发 >1 会出问题，串行+小间隔；300ms 足够防抖且链路总耗时可控
+const CHAIN_GAP_MS = 300;
+const tokenQueues = new Map();
+
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-function enqueue(fn) {
+function enqueue(fn, token = '') {
+  // 有 token 时用 per-token 队列，无 token 用全局队列
+  if (token) {
+    if (!tokenQueues.has(token)) {
+      tokenQueues.set(token, Promise.resolve());
+    }
+    const q = tokenQueues.get(token);
+    const run = q.then(() => sleep(CHAIN_GAP_MS)).then(fn);
+    tokenQueues.set(token, run.catch(() => {}));
+    return run;
+  }
   const run = chainTail.then(() => sleep(CHAIN_GAP_MS)).then(fn);
   chainTail = run.catch(() => {});
   return run;
 }
 
 const UPSTREAM_TIMEOUT_MS = 20000; // 上游单请求超时，避免客户端干等
+const STREAM_TIMEOUT_MS = 60000; // 流式 chat 超时：长回复/推理可能耗时 >20s，给足 60s
 const NONSTREAM_TIMEOUT_MS = 45000; // 非流式要聚合完整上游流（含推理），给更充裕时间
 const SESSION_TIMEOUT_MS = 10000;  // session/run 等短交互更快失败
 
@@ -274,6 +328,7 @@ async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPST
   };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (RELAY_KEY) headers["x-relay-key"] = RELAY_KEY;
   Object.assign(headers, extraHeaders);
 
   const resp = await fetch(CODEBUFF_API + path, {
@@ -289,14 +344,14 @@ async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPST
 }
 
 function enqueueUp(method, path, token, body, extraHeaders, timeoutMs) {
-  return enqueue(() => up(method, path, token, body, extraHeaders, timeoutMs));
+  return enqueue(() => up(method, path, token, body, extraHeaders, timeoutMs), token);
 }
 
 // ---------------------------------------------------------------------------
 // session 生命周期
 // ---------------------------------------------------------------------------
 
-async function createSession(token, sessionModel, forceCreate = false) {
+const _createSessionInner = async function(token, sessionModel, forceCreate = false) {
   // 0) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
   if (!forceCreate) {
     const cached = sessCache.get(token + ":" + sessionModel);
@@ -320,19 +375,20 @@ async function createSession(token, sessionModel, forceCreate = false) {
     }
   }
 
-  // ad) 刷广告 + streak 签到：还原官方 CLI 行为，在创建 session 前上报广告曝光 + 签到。
-  //      官方流程（参考 XxxXTeam/freebuff2api codebuff.py _request_ads_and_streak）：
-  //      广告曝光后调 GET /api/v1/freebuff/streak 签到，连续使用可获 streak 额度加成
-  //      （limit = base + referral + streak）。失败静默、超时 5s，完全不影响聊天。
-  try {
-    await enqueueUp("POST", "/api/v1/ads", token,
+  // ad) 刷广告 + streak 签到（fire-and-forget，不阻塞 session 创建）
+  //      还原官方 CLI 行为：广告曝光后调 GET /api/v1/freebuff/streak 签到，连续使用可获 streak 额度加成
+  //      （limit = base + referral + streak）。失败静默，完全不影响聊天。
+  (async () => {
+    try {
+      await enqueueUp("POST", "/api/v1/ads", token,
       { provider: "gravity", sessionId: crypto.randomUUID(), surface: "waiting_room",
         device: { os: "windows", timezone: "Asia/Shanghai", locale: "zh-CN" },
         userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" },
       { "Content-Type": "application/json" }, 5000);
     // streak 签到（v1.6.3）：GET /api/v1/freebuff/streak，0 消耗，连续使用加额度
-    await enqueueUp("GET", "/api/v1/freebuff/streak", token, undefined, undefined, 5000);
-  } catch {}
+      await enqueueUp("GET", "/api/v1/freebuff/streak", token, undefined, undefined, 5000);
+    } catch {}
+  })();
 
   // 2) create（可能 queue）。⚠️ 实测(2026-08-07)：x-freebuff-multi-session:1 创建的实例上游 GET 为
   //    status:none、chat 报 428 waiting_room_required；必须不带该 header 用默认主 session 才有效
@@ -358,6 +414,23 @@ async function createSession(token, sessionModel, forceCreate = false) {
   }
   if (r.status === 409) throw new Error("session_model_mismatch: " + String(r.data?.message || r.data?.error || "上游拒绝该模型"));
   throw new Error("create session failed: " + r.status + " " + (r.text || "").slice(0, 300));
+};
+
+/** createSession 去重包装：同一 token:model 的在途创建直接复用结果 */
+function createSession(token, sessionModel, forceCreate = false) {
+  const sessKey = token + ":" + sessionModel;
+  if (!forceCreate && pendingSessions.has(sessKey)) {
+    return pendingSessions.get(sessKey);
+  }
+  const promise = (async () => {
+    try {
+      return await _createSessionInner(token, sessionModel, forceCreate);
+    } finally {
+      pendingSessions.delete(sessKey);
+    }
+  })();
+  pendingSessions.set(sessKey, promise);
+  return promise;
 }
 
 // ---------------------------------------------------------------------------
@@ -574,9 +647,275 @@ function responsesInputToMessages(input, instructions) {
   return messages;
 }
 
+// ---------------------------------------------------------------------------
+// Anthropic Messages API（/v1/messages）→ chat completions 上游
+// ---------------------------------------------------------------------------
+
+// Anthropic Messages 入口（Claude Code / Claude API 客户端）
+async function handleMessages(request, env) {
+  let params;
+  try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
+  const isStream = !!params.stream;
+  const mc = MODELS.find((m) => m.id === (params.model || DEFAULT_MODEL)) || MODELS[0];
+  return executeChat(env, anthropicToChatParams(params, mc), mc, isStream, "anthropic");
+}
+
+// Anthropic Messages 请求 → chat completions 参数
+function anthropicToChatParams(params, mc) {
+  const chat = {};
+  for (const k of ["temperature", "top_p", "stop_sequences", "metadata", "stream"]) {
+    if (params[k] !== undefined && params[k] !== null) chat[k] = params[k];
+  }
+  if (params.max_tokens !== undefined && params.max_tokens !== null) chat.max_tokens = params.max_tokens;
+  // Anthropic top_k → chat top_k（OpenAI 兼容端上游普遍支持）
+  if (params.top_k !== undefined && params.top_k !== null) chat.top_k = params.top_k;
+  // Anthropic tools（name/description/input_schema）→ chat completions 格式
+  if (Array.isArray(params.tools)) {
+    chat.tools = params.tools
+      .filter((t) => t && typeof t === "object" && t.name)
+      .map((t) => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description || "",
+          parameters: t.input_schema || { type: "object", properties: {} },
+        },
+      }));
+    if (chat.tools.length === 0) delete chat.tools;
+  }
+  if (params.tool_choice && typeof params.tool_choice === "object") {
+    if (params.tool_choice.type === "auto") chat.tool_choice = "auto";
+    else if (params.tool_choice.type === "any") chat.tool_choice = "required";
+    else if (params.tool_choice.type === "tool" && params.tool_choice.name) {
+      chat.tool_choice = { type: "function", function: { name: params.tool_choice.name } };
+    } else chat.tool_choice = "auto";
+  }
+  chat.model = mc.id;
+  chat.messages = anthropicToMessages(params);
+  return chat;
+}
+
+// Anthropic messages + system → OpenAI messages
+function anthropicToMessages(params) {
+  const messages = [];
+  const sys = params.system;
+  if (typeof sys === "string" && sys) messages.push({ role: "system", content: sys });
+  else if (Array.isArray(sys)) {
+    const parts = [];
+    for (const s of sys) {
+      if (!s || typeof s !== "object") continue;
+      if (s.type === "text" && s.text) parts.push({ type: "text", text: s.text });
+    }
+    if (parts.length) messages.push({ role: "system", content: parts });
+  }
+  if (!Array.isArray(params.messages)) return messages;
+  for (const m of params.messages) {
+    if (!m || typeof m !== "object") continue;
+    const role = m.role;
+    const content = m.content;
+    // 简单字符串
+    if (typeof content === "string") { messages.push({ role, content }); continue; }
+    // 块数组（text / tool_use / tool_result / image 等）
+    if (Array.isArray(content)) {
+      const parts = [];
+      let toolCalls = [];
+      for (const c of content) {
+        if (!c || typeof c !== "object") continue;
+        if (c.type === "text" && c.text) { parts.push({ type: "text", text: c.text }); continue; }
+        if (c.type === "tool_use" && c.id) {
+          toolCalls.push({ id: c.id, type: "function", function: { name: c.name || "", arguments: JSON.stringify(c.input ?? {}) } });
+          continue;
+        }
+        if (c.type === "tool_result") {
+          const content2 = typeof c.content === "string" ? c.content : Array.isArray(c.content) ? c.content.map((x) => (x && x.type === "text" ? x.text : "")).join("") : "";
+          messages.push({ role: "tool", tool_call_id: c.tool_use_id || "", content: content2 });
+          continue;
+        }
+        if (c.type === "image" && c.source && c.source.data) {
+          parts.push({ type: "image_url", image_url: { url: `data:${c.source.media_type || "image/png"};base64,${c.source.data}` } });
+          continue;
+        }
+      }
+      if (toolCalls.length) {
+        messages.push({ role: "assistant", content: parts.length ? parts : null, tool_calls: toolCalls });
+      } else if (parts.length) {
+        messages.push({ role, content: parts });
+      } else {
+        messages.push({ role, content: "" });
+      }
+      continue;
+    }
+    messages.push({ role, content: content == null ? "" : String(content) });
+  }
+  return messages;
+}
+
+// 非流式：上游 chat SSE → Anthropic Messages 非流式响应
+async function anthropicToNonStream(upstreamBody, mc) {
+  const reader = upstreamBody.getReader();
+  const decoder = new TextDecoder();
+  let buf = "", text = "", reasoning = "", stopReason = null, model = "", id = "", usage = null;
+  let toolCalls = [];
+  let curTool = null;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "" || payload === "[DONE]") continue;
+      try {
+        const obj = unwrapData(JSON.parse(payload));
+        const choice = obj?.choices?.[0];
+        if (!choice) continue;
+        const delta = choice.delta || {};
+        if (delta.content) text += delta.content;
+        if (delta.reasoning_content) reasoning += delta.reasoning_content;
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            if (tc.id && tc.function && tc.function.name) {
+              if (curTool && curTool.function) toolCalls.push(curTool);
+              curTool = { id: tc.id, function: { name: tc.function.name, arguments: tc.function.arguments || "" } };
+            } else if (curTool && tc.function && typeof tc.function.arguments === "string") {
+              curTool.function.arguments += tc.function.arguments;
+            }
+          }
+        }
+        if (choice.finish_reason) stopReason = choice.finish_reason;
+        if (obj.id) id = obj.id;
+        if (obj.model) model = obj.model;
+        if (obj.usage) usage = obj.usage;
+      } catch {}
+    }
+  }
+  if (curTool) toolCalls.push(curTool);
+  const content = [];
+  if (text) content.push({ type: "text", text });
+  if (reasoning && !text) content.push({ type: "text", text: reasoning });
+  for (const tc of toolCalls) {
+    let input = {};
+    try { input = tc.function.arguments ? JSON.parse(tc.function.arguments) : {}; } catch { input = { _raw: tc.function.arguments }; }
+    content.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
+  }
+  const anthropicStop = stopReason === "tool_calls" ? "tool_use" : stopReason === "length" ? "max_tokens" : "end_turn";
+  return {
+    id: id || "msg_" + Math.random().toString(36).slice(2, 10),
+    type: "message",
+    role: "assistant",
+    model: model || mc.id,
+    content,
+    stop_reason: anthropicStop,
+    stop_sequence: null,
+    usage: {
+      input_tokens: usage?.prompt_tokens || 0,
+      output_tokens: usage?.completion_tokens || 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    },
+  };
+}
+
+// 流式：上游 chat SSE → Anthropic Messages SSE 事件序列
+async function pipeUpstreamToAnthropicStream(upstreamBody, writable, mc, onDone) {
+  const reader = upstreamBody.getReader();
+  const writer = writable.getWriter();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const msgId = "msg_" + Math.random().toString(36).slice(2, 10);
+  let buf = "", text = "", reasoning = "", model = mc.id, stopReason = "end_turn";
+  let curTool = null;
+  const send = (evt, obj) => writer.write(encoder.encode(`event: ${evt}\ndata: ${JSON.stringify(obj)}\n\n`));
+  send("message_start", {
+    type: "message_start",
+    message: {
+      id: msgId, type: "message", role: "assistant", model: mc.id,
+      content: [], stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    },
+  });
+  // 块状态机：每个块 start → delta… → stop
+  let textBlockOpen = false;
+  let textBlockIndex = 0;
+  let curToolBlockIndex = 0;
+  (async () => {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "" || payload === "[DONE]") continue;
+          let obj;
+          try { obj = unwrapData(JSON.parse(payload)); } catch { continue; }
+          const choice = obj?.choices?.[0];
+          if (!choice) continue;
+          const delta = choice.delta || {};
+          // 文本：首个 chunk 开块，后续只发 delta
+          if (delta.content) {
+            text += delta.content;
+            if (!textBlockOpen) {
+              textBlockIndex = curTool ? curToolBlockIndex + 1 : 0;
+              send("content_block_start", {
+                type: "content_block_start", index: textBlockIndex, content_block: { type: "text", text: "" },
+              });
+              textBlockOpen = true;
+            }
+            send("content_block_delta", { type: "content_block_delta", index: textBlockIndex, delta: { type: "text_delta", text: delta.content } });
+          }
+          if (delta.reasoning_content) {
+            reasoning += delta.reasoning_content;
+          }
+          if (delta.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              if (tc.id && tc.function && tc.function.name) {
+                // 上一个文本块先收尾
+                if (textBlockOpen) {
+                  send("content_block_stop", { type: "content_block_stop", index: textBlockIndex });
+                  textBlockOpen = false;
+                }
+                // 上一个工具块收尾（多个工具时）
+                if (curTool) send("content_block_stop", { type: "content_block_stop", index: curToolBlockIndex });
+                curTool = { id: tc.id, name: tc.function.name };
+                curToolBlockIndex = textBlockOpen ? textBlockIndex + 1 : 0;
+                send("content_block_start", {
+                  type: "content_block_start", index: curToolBlockIndex, content_block: { type: "tool_use", id: tc.id, name: tc.function.name, input: {} },
+                });
+              } else if (curTool && tc.function && typeof tc.function.arguments === "string") {
+                curTool.arguments += tc.function.arguments;
+                send("content_block_delta", { type: "content_block_delta", index: curToolBlockIndex, delta: { type: "input_json_delta", partial_json: tc.function.arguments } });
+              }
+            }
+          }
+          if (choice.finish_reason) {
+            stopReason = choice.finish_reason === "tool_calls" ? "tool_use" : choice.finish_reason === "length" ? "max_tokens" : "end_turn";
+          }
+          if (obj.model) model = obj.model;
+        }
+      }
+    } catch {}
+    finally {
+      // 收尾所有未关闭的块
+      if (textBlockOpen) send("content_block_stop", { type: "content_block_stop", index: textBlockIndex });
+      if (curTool) send("content_block_stop", { type: "content_block_stop", index: curToolBlockIndex });
+      send("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 0 } });
+      send("message_stop", { type: "message_stop" });
+      try { await writer.close(); } catch {}
+      if (onDone) onDone();
+    }
+  })();
+}
+
 // chat completions 与 responses 共用的上游执行：多号重试 + session/run 生命周期 + 流式/非流式出口
 async function executeChat(env, chatParams, mc, isStream, mode) {
   const debug = env.FREEBUFF_DEBUG === "true";
+  const reqStart = Date.now();
   const pool = parseAccounts(env);
   if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
 
@@ -584,7 +923,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
   // 免费通道上游波动大（并发>1 即出问题、排队超时），单请求内换号比等客户端重试成功率高得多。
   let lastErrMsg = "";
   for (let acctTry = 0; acctTry < pool.length; acctTry++) {
-    const acct = pickToken(env, mc.session);
+    const acct = await pickTokenLocked(env, mc.session);
     const token = acct ? acct.token : null;
     if (!token) break;
     try {
@@ -615,10 +954,11 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         const globalUid = env.FREEBUFF_USER_ID && env.FREEBUFF_USER_ID !== "2027142c-e843-443f-b7d0-d636016d37c4" ? env.FREEBUFF_USER_ID : null;
         const actingUid = acctUid || globalUid;
         if (actingUid) headers["x-freebuff-acting-user-id"] = actingUid;
+        if (RELAY_KEY) headers["x-relay-key"] = RELAY_KEY;
         if (debug) console.log(`[acct ${acctTry + 1}][chat] attempt=${attempt + 1}`);
         resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
           method: "POST", headers, body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(isStream ? UPSTREAM_TIMEOUT_MS : NONSTREAM_TIMEOUT_MS),
+          signal: AbortSignal.timeout(isStream ? STREAM_TIMEOUT_MS : NONSTREAM_TIMEOUT_MS),
         });
         if (resp.ok) break;
         errText = await resp.text();
@@ -642,19 +982,52 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       if (!resp.ok) {
         lastErrMsg = "upstream error: " + (errText || "").slice(0, 300);
         if (debug) console.log(`[acct ${acctTry + 1}] failed ${resp.status}, switch account`);
+        activeRequestsPerToken.set(token, Math.max(0, (activeRequestsPerToken.get(token) || 1) - 1));
         continue;
       }
 
+      // 成功后是否释放活跃计数：流式延迟到流结束，非流式立即释放
       if (isStream) {
+        const tokenForRelease = token;
         const { readable, writable } = new TransformStream();
-        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc);
-        else pipeUpstreamToClient(resp.body, writable);
+        const ttftMs = Date.now() - reqStart;
+        if (mode === "responses") {
+          pipeUpstreamToResponsesStream(resp.body, writable, mc, () => {
+            activeRequestsPerToken.set(tokenForRelease, Math.max(0, (activeRequestsPerToken.get(tokenForRelease) || 1) - 1));
+          });
+        }
+        else if (mode === "anthropic") {
+          pipeUpstreamToAnthropicStream(resp.body, writable, mc, () => {
+            activeRequestsPerToken.set(tokenForRelease, Math.max(0, (activeRequestsPerToken.get(tokenForRelease) || 1) - 1));
+          });
+        }
+        else {
+          pipeUpstreamToClient(resp.body, writable, () => {
+            activeRequestsPerToken.set(tokenForRelease, Math.max(0, (activeRequestsPerToken.get(tokenForRelease) || 1) - 1));
+          });
+        }
+        if (debug) console.log(`[req ${mode}] stream ok, 首字节 ${ttftMs}ms`);
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
 
-      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc), 200);
+      activeRequestsPerToken.set(token, Math.max(0, (activeRequestsPerToken.get(token) || 1) - 1));
+      const reqMs = Date.now() - reqStart;
+      if (mode === "responses") {
+        activeRequestsPerToken.delete(token);
+        const out = await responsesToNonStream(resp.body, mc);
+        if (debug) console.log(`[req ${mode}] ok ${reqMs}ms`);
+        return jsonResponse(out, 200);
+      }
+      if (mode === "anthropic") {
+        activeRequestsPerToken.delete(token);
+        const out = await anthropicToNonStream(resp.body, mc);
+        if (debug) console.log(`[req ${mode}] ok ${reqMs}ms`);
+        return jsonResponse(out, 200);
+      }
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
+      activeRequestsPerToken.delete(token);
+      if (debug) console.log(`[req ${mode}] ok ${reqMs}ms`);
       return jsonResponse(agg, 200);
     } catch (e) {
       console.error("[" + mode + "]", e);
@@ -668,8 +1041,11 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       }
       lastErrMsg = msg;
       if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
+      activeRequestsPerToken.set(token, Math.max(0, (activeRequestsPerToken.get(token) || 1) - 1));
     }
   }
+  const reqMs = Date.now() - reqStart;
+  if (debug) console.log(`[req ${mode}] failed ${reqMs}ms: ${lastErrMsg.slice(0, 100)}`);
   return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502);
 }
 
@@ -683,39 +1059,34 @@ function unwrapData(obj) {
   return obj;
 }
 
-// 流式：把上游 SSE 剥 {data:...} 包装后透传
-function pipeUpstreamToClient(upstreamBody, writable) {
+// 流式透传：原始字节拷贝，不做 JSON 解析（避免 CPU 超限，支持并发）。
+// 上游 Freebuff 返回标准 OpenAI SSE 格式，直接透传即可。
+function pipeUpstreamToClient(upstreamBody, writable, onDone) {
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buf = "";
+  let sawDone = false;
   (async () => {
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
-          if (line.startsWith("data:")) {
-            const payload = line.slice(5).trim();
-            if (payload === "" || payload === "[DONE]") { await writer.write(encoder.encode(line + "\n\n")); continue; }
-            try {
-              const normalized = unwrapData(JSON.parse(payload));
-              await writer.write(encoder.encode("data: " + JSON.stringify(normalized) + "\n\n"));
-            } catch { await writer.write(encoder.encode(line + "\n")); }
-          } else {
-            await writer.write(encoder.encode(line + "\n"));
-          }
-        }
+        const text = decoder.decode(value, { stream: true });
+        if (text.includes("[DONE]")) sawDone = true;
+        await writer.write(encoder.encode(text));
       }
     } catch {}
-    finally { try { await writer.close(); } catch {} }
+    finally {
+      try {
+        if (!sawDone) await writer.write(encoder.encode("data: [DONE]\n\n"));
+        await writer.close();
+      } catch {}
+      if (onDone) onDone();
+    }
   })();
 }
-
 // 非流式：聚合上游流成 OpenAI 非流式对象
 async function streamToNonStream(upstreamBody, upstreamModel) {
   const reader = upstreamBody.getReader();
@@ -821,7 +1192,7 @@ function chatUsageToResponsesUsage(usage) {
 }
 
 // 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
-async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc) {
+async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onDone) {
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
   const decoder = new TextDecoder();
@@ -956,7 +1327,10 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc) {
       resp.usage = chatUsageToResponsesUsage(usage);
       await send({ type: "response.completed", response: resp });
     } catch {}
-    finally { try { await writer.close(); } catch {} }
+    finally {
+      try { await writer.close(); } catch {}
+      if (onDone) onDone();
+    }
   })();
 }
 
